@@ -4,8 +4,10 @@
 
 // Dart imports:
 import 'dart:async';
+import 'dart:io';
 
 // Package imports:
+import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 
 // Project imports:
@@ -26,6 +28,10 @@ class VadHandler {
   bool _submitUserSpeechOnPause = false;
   bool _isPaused = false;
 
+  // File recording fields
+  IOSink? _fileSink;
+  String? _recordFilePath;
+
   // Track current model parameters to detect changes
   String? _currentModel;
   int? _currentFrameSamples;
@@ -40,8 +46,7 @@ class VadHandler {
   int? _currentNumFramesToEmit;
 
   final _onSpeechEndController = StreamController<List<double>>.broadcast();
-  final _onFrameProcessedController = StreamController<
-      ({double isSpeech, double notSpeech, List<double> frame})>.broadcast();
+  final _onFrameProcessedController = StreamController<({double isSpeech, double notSpeech, List<double> frame})>.broadcast();
   final _onSpeechStartController = StreamController<void>.broadcast();
   final _onRealSpeechStartController = StreamController<void>.broadcast();
   final _onVADMisfireController = StreamController<void>.broadcast();
@@ -58,8 +63,7 @@ class VadHandler {
   Stream<List<double>> get onSpeechEnd => _onSpeechEndController.stream;
 
   /// Stream of frame processing events with speech probabilities and raw frame data
-  Stream<({double isSpeech, double notSpeech, List<double> frame})>
-      get onFrameProcessed => _onFrameProcessedController.stream;
+  Stream<({double isSpeech, double notSpeech, List<double> frame})> get onFrameProcessed => _onFrameProcessedController.stream;
 
   /// Stream of initial speech start detection events
   Stream<void> get onSpeechStart => _onSpeechStartController.stream;
@@ -75,6 +79,8 @@ class VadHandler {
 
   /// Stream of audio chunk events containing intermediate audio data during speech with final flag
   Stream<({List<double> samples, bool isFinal})> get onEmitChunk => _onEmitChunkController.stream;
+
+  String? get recordedFilePath => _recordFilePath;
 
   void _handleVadEvent(VadEvent event) {
     switch (event.type) {
@@ -93,11 +99,8 @@ class VadHandler {
         break;
       case VadEventType.frameProcessed:
         if (event.probabilities != null && event.frameData != null) {
-          _onFrameProcessedController.add((
-            isSpeech: event.probabilities!.isSpeech,
-            notSpeech: event.probabilities!.notSpeech,
-            frame: event.frameData!
-          ));
+          _onFrameProcessedController
+              .add((isSpeech: event.probabilities!.isSpeech, notSpeech: event.probabilities!.notSpeech, frame: event.frameData!));
         }
         break;
       case VadEventType.misfire:
@@ -141,16 +144,14 @@ class VadHandler {
   Future<void> startListening(
       {double positiveSpeechThreshold = 0.5,
       double negativeSpeechThreshold = 0.35,
-      int preSpeechPadFrames = 1,
-      int redemptionFrames = 8,
+      int preSpeechPadFrames = 30,
+      int redemptionFrames = 24,
       int frameSamples = 1536,
-      int minSpeechFrames = 3,
+      int minSpeechFrames = 8,
       bool submitUserSpeechOnPause = false,
-      String model = 'v4',
-      String baseAssetPath =
-          'https://cdn.jsdelivr.net/npm/@keyurmaru/vad@0.0.1/',
-      String onnxWASMBasePath =
-          'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/',
+      String model = 'v5',
+      String baseAssetPath = 'https://cdn.jsdelivr.net/npm/@keyurmaru/vad@0.0.1/',
+      String onnxWASMBasePath = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/',
       RecordConfig? recordConfig,
       int endSpeechPadFrames = 1,
       int numFramesToEmit = 0}) async {
@@ -198,8 +199,7 @@ class VadHandler {
 
     if (!_isInitialized || parametersChanged) {
       if (_isDebug) {
-        print(
-            'VadHandler: Creating new VAD iterator - initialized: $_isInitialized, parametersChanged: $parametersChanged');
+        print('VadHandler: Creating new VAD iterator - initialized: $_isInitialized, parametersChanged: $parametersChanged');
       }
 
       // Release old iterator if it exists
@@ -278,15 +278,22 @@ class VadHandler {
       print('VadHandler: Creating audio recorder config');
     }
 
+    if (_recordFilePath == null) {
+      final tmp = await getTemporaryDirectory();
+      _recordFilePath = '${tmp.path}/vad_recording.pcm';
+    }
+    _fileSink = File(_recordFilePath!).openWrite();
+
     final config = recordConfig ??
         const RecordConfig(
-            encoder: AudioEncoder.pcm16bits,
-            sampleRate: 16000,
-            bitRate: 16,
-            numChannels: 1,
-            echoCancel: true,
-            autoGain: true,
-            noiseSuppress: true);
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: 16000,
+          bitRate: 16,
+          numChannels: 1,
+          echoCancel: true,
+          autoGain: true,
+          noiseSuppress: true,
+        );
     if (_isDebug) {
       print('VadHandler: Starting audio stream');
     }
@@ -295,6 +302,9 @@ class VadHandler {
       final stream = await _audioRecorder.startStream(config);
 
       _audioStreamSubscription = stream.listen((data) async {
+        // write raw PCM
+        _fileSink!.add(data);
+        // process VAD
         if (!_isPaused) {
           await _vadIterator?.processAudioData(data);
         }
@@ -333,6 +343,13 @@ class VadHandler {
       if (_isDebug) print('VadHandler: Resetting VAD iterator');
       _vadIterator?.reset();
       _isPaused = false;
+
+      // finalize file
+      if (_fileSink != null) {
+        await _fileSink!.flush();
+        await _fileSink!.close();
+        _fileSink = null;
+      }
 
       if (_isDebug) print('VadHandler: stopListening completed');
     } catch (e) {
